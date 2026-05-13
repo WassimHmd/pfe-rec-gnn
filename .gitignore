@@ -1,0 +1,15 @@
+# .gitignore
+data/raw/
+data/processed/
+*.h5
+*.npy
+*.parquet
+*.json.gz
+*.feather
+
+# Keep the small JSON mappings tracked
+!data/processed/*_to_idx.json
+!data/processed/*_norm_stats.json
+!data/processed/*_columns.json
+
+*graphify-out

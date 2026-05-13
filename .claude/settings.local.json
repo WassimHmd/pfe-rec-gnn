@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(conda run *)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\wassim\\\\Desktop\\\\PFE Master\\\\data\\\\processed\\\\\" -ErrorAction SilentlyContinue | ForEach-Object { \"$\\($_.Name\\) \\($\\([math]::Round\\($_.Length/1MB,1\\)\\) MB\\)\" })",
+      "PowerShell(conda run *)"
+    ]
+  }
+}
