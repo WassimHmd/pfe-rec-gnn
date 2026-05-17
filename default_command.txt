@@ -1,0 +1,2 @@
+$env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+python -m training.train --epochs 20 --batch_size 256 --fanout 5 3 3 --num_layers 3 --d_model 256 --id_dim 128 --num_workers 4 --no_shelved --eval_max_users 5000 --resume training/runs/20260515-064619/best.pt --note "v4 reset-between-epochs"

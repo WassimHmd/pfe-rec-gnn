@@ -13,3 +13,6 @@ data/processed/
 !data/processed/*_columns.json
 
 *graphify-out
+
+*pycache*
+*runs

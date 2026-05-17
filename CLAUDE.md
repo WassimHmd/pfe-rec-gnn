@@ -6,29 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **HGT4Rec** — a heterogeneous knowledge-graph recommender (Master's thesis / PFE) built on the UCSD Goodreads poetry slice. The model is a Heterogeneous Graph Transformer (HGT, Hu et al. WWW 2020) trained for user→book link prediction. Full spec: `goodreads-hgt-project-spec-v2.md` (authoritative — follow it when this file is silent).
 
-Pipeline stages (Phase 1 = current):
-1. MongoDB → data cleaning & normalization
-2. Neo4j load (exploration/visualization only, not in training loop)
-3. Frozen text embeddings via BGE-base-en-v1.5 (768 dim) → HDF5
-4. Numeric feature blocks → `.npy`
-5. Integer index mappings → `*_to_idx.json`
-6. PyG `HeteroData` construction → HGT training
+Pipeline stages (Phase 1 complete; training runs reproducible end-to-end):
+1. **Preprocessing** — `preprocessing/preprocess.ipynb`: one notebook, Mongo → `data/processed/`. Produces every `*_to_idx.json`, `*_bge_base_768.h5`, `*_numeric.npy`, `splits/{train,val,test}.npz`, and `hetero_data.pt`. Parameterize `SLICE_DB` / `META_DB` at the top to point at any Goodreads slice.
+2. **Training** — `training/train.py`: HGT4Rec link prediction with HeteroData input, checkpointing, resume, per-epoch memory-leak reset.
+3. **Neo4j** — optional visualization only (last cell of the preprocess notebook, off by default).
 
 ## Running the Pipeline
 
-**Generate book + review embeddings:**
-```bash
-python preprocessing/embed.py
+**Preprocess a Mongo slice → `data/processed/`** (one notebook, top-to-bottom):
 ```
-Input: `data/raw/goodreads_{books,reviews}_poetry.json.gz`  
-Output: `data/embeddings/{books,reviews}_bge_base_768.h5`  
-If OOM on GPU, lower `BATCH_SIZE` from 256 → 128 in `embed.py`.
+preprocessing/preprocess.ipynb
+```
+Set `SLICE_DB` / `META_DB` in the first cell to point at any partial Goodreads slice (default `poetry` / `goodreads`). Produces every `*_to_idx.json`, every `*_bge_base_768.h5`, every `*_numeric.npy`, the temporal `splits/{train,val,test}.npz`, and the assembled `hetero_data.pt`. Reads Mongo only — Neo4j is an optional final-cell export for visualization (`PUSH_TO_NEO4J = True`). GPU bound: ~30 min for the 4 BGE-768 embedding cells; rest is pandas + small I/O.
 
-**Build the knowledge graph** (JupyterLab, run in order):
-1. `preprocessing/KG.ipynb` — full graph: books, authors, works, users, reviews, interactions
-2. `preprocessing/kg_mod.ipynb` — Language, Format, Publisher nodes/edges
+**Legacy scripts (deprecated by the notebook, kept for reference)**: `KG.ipynb`, `kg_mod.ipynb`, `embed.py`, `embed_authors.py`, `embed_works.py`, `build_idx_maps.py`, `build_review_idx.py`, `build_review_numeric.py`, `build_splits.py`, `build_hetero_data.py`, `fix_shelf_idx.py`. The notebook supersedes all of them — every step from raw Mongo to `hetero_data.pt` is in one place.
 
-**Sanity-check embeddings:** `preprocessing/test.ipynb` — reads the first 5 rows of any HDF5 and checks shape/dtype.
+**Train** (canonical command lives in `default_command.txt`):
+```powershell
+$env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+python -m training.train --epochs 20 --batch_size 256 --fanout 5 3 3 `
+    --num_layers 3 --d_model 256 --id_dim 128 --num_workers 4 `
+    --no_shelved --eval_max_users 5000 --note "<run label>"
+```
+Every knob has a `Config` default in `training/config.py`; CLI flags override. Common flags: `--resume <path/to/best.pt>`, `--max_train_edges N` (smoke test), `--persistent_workers` (off by default on Windows). Run output: `training/runs/<timestamp>/{best.pt, last.pt, metrics.csv, summary.json}`.
+
+**Sanity-check embeddings:** the last cell of `preprocess.ipynb` does in-place verification (shapes, dtypes, idx-map round-trips, edge-index bounds, split totals). The standalone `preprocessing/sanity_check.ipynb` is still around if you need to re-verify without rerunning the full pipeline.
 
 ## Infrastructure
 
@@ -108,6 +110,8 @@ No elementwise product, no absolute difference.
 
 ## Processed Artifacts Layout
 
+All artifacts below exist on disk.
+
 ```
 data/processed/
 ├── books_bge_base_768.h5          # (36514, 768) float32, sorted by ascending book_id
@@ -116,47 +120,78 @@ data/processed/
 ├── book_norm_stats.json           # imputation/z-score stats (full-corpus, Phase 1 shortcut)
 ├── book_numeric_columns.json      # column order documentation
 │
-├── authors_bge_base_768.h5        # (planned)
-├── author_numeric.npy             # (planned)
-├── author_to_idx.json             # (planned)
+├── authors_bge_base_768.h5
+├── author_numeric.npy
+├── author_numeric_columns.json
+├── author_to_idx.json
 │
-├── works_bge_base_768.h5          # (planned)
-├── work_numeric.npy               # (planned)
-├── work_to_idx.json               # (planned)
+├── works_bge_base_768.h5
+├── work_numeric.npy
+├── work_numeric_columns.json
+├── work_norm_stats.json
+├── work_to_idx.json
 │
-├── reviews_bge_base_768.h5        # (planned)
-├── review_numeric.npy             # (planned)
+├── reviews_bge_base_768.h5
+├── review_numeric.npy
+├── review_numeric_columns.json
+├── review_to_idx.json
 │
-├── user_to_idx.json               # (planned) — from union of reviews + interactions user_ids
-├── genre_to_idx.json              # (to confirm)
-├── shelf_to_idx.json              # (to confirm)
-├── language_to_idx.json           # saved
-├── format_to_idx.json             # saved
-└── publisher_to_idx.json          # saved
+├── user_to_idx.json               # union of reviews + interactions user_ids
+├── genre_to_idx.json
+├── shelf_to_idx.json
+├── language_to_idx.json
+├── format_to_idx.json
+├── publisher_to_idx.json
+│
+├── hetero_data.pt                 # assembled PyG HeteroData (input to training)
+├── hetero_meta.json               # node/edge type metadata
+└── splits/
+    ├── train.npz                  # user_idx, book_idx, label  (label ∈ {0,1})
+    ├── val.npz
+    ├── test.npz
+    └── split_stats.json           # date boundaries, counts
 ```
 
-Raw data (`data/raw/`) and large artifacts (`*.h5`, `*.npy`) are gitignored. Small JSON mappings are tracked.
+Raw data (`data/raw/`) and large artifacts (`*.h5`, `*.npy`, `*.pt`) are gitignored. Small JSON mappings + splits are tracked.
 
-## Phase 1 Status
+## Status
 
-**Completed:** Mongo ingestion, all cleaning/normalization, Neo4j full load, book text embeddings, book numeric block, categorical `*_to_idx.json` for Language/Format/Publisher.
+**Phase 1 complete.** All preprocessing artifacts on disk; `HeteroData` + temporal splits built; modular HGT training pipeline runs end-to-end with checkpointing, resume, and per-epoch reset for memory-leak mitigation. Smoke + multi-epoch runs verified on laptop (6 GB GPU) and queued for full-spec runs on A4000 (16 GB).
 
-**Next steps (in order):**
-1. Save remaining `*_to_idx.json`: User, Author, Work, Genre, Shelf
-2. Compute text embeddings + numeric blocks for Author, Work, Review
-3. Build PyG `HeteroData` from all artifacts
-4. Implement HGT model, link prediction head, training loop, evaluation
+**Training pipeline layout** (`training/`):
+- `train.py` — entry point, CLI, loop, checkpointing
+- `config.py` — single `Config` dataclass; every knob lives here
+- `featurizer.py` — per-node-type U / MN / TN assembly at batch time
+- `graph_filter.py` — applies edge-type toggles from `Config`
+- `model.py` — `HGT4Rec` wrapper (encoder + head); `SUPERVISION_KEY` synthetic edge type
+- `eval.py` — full-candidate-set eval with work-level dedup
+- `utils.py` — run dir, CSV logger, AMP context, perf settings
+- `components/{encoders,heads,samplers}/` — swappable modules for ablation (e.g. `HGTEncoder` ↔ alternatives; `MLPHead` ↔ alternatives)
+
+**Next:**
+1. Full-spec baseline run on A4000 (all edges incl. SHELVED, fanout [15,10,5], d_model=256, num_layers=3)
+2. Ablation sweep (see `goodreads-hgt-project-spec-v2.md` §17)
+3. Final test-set numbers from best checkpoint with `eval_max_users=0`
 
 ## Key Implementation Notes
 
+### Data / featurization
 - Text and numeric are stored **separately on disk**, concatenated in CPU at `HeteroData` construction time. Rationale: enables independent updates and Phase 3 encoder fine-tuning.
 - Review text is NOT stored on Neo4j `Review` nodes — metadata only in Neo4j, text in HDF5.
 - All embeddings are L2-normalized at generation time → cosine similarity = dot product downstream.
 - Neo4j bulk writes use 10K-row chunked `MERGE` batches.
 - Timestamps use Goodreads format `"%a %b %d %H:%M:%S %z %Y"` — parse with `utc=True` to normalize timezones.
-- `requirements.txt` is UTF-16 LE encoded (Windows); parse with `encoding='utf-16'`.
-- `book_norm_stats.json` stats are computed over the full corpus (Phase 1 shortcut, documented in `_note` field) — tighten to training split in Phase 2.
+- `*_norm_stats.json` stats are computed over the full corpus (Phase 1 shortcut, documented in `_note` field) — tighten to training split in Phase 2.
 - The five U-category categorical node types (Genre, Shelf, Language, Format, Publisher) are a deliberate design decision — do not drop them without new evidence (spec §13).
+
+### Training operational gotchas
+- **PyG `NegativeSampling(mode="binary")` shifts labels by +1.** Input `{0, 1}` becomes batch `{0, 1, 2}` where `2` = original positive, `1` = explicit negative (RATED_LOW), `0` = sampled random negative. BCE target = `(edge_label == 2).float()`. Already handled in `train.py`.
+- **AMP is OFF by default** (`cfg.amp_dtype="none"`). `pyg_lib.grouped_matmul` is fp32-only — bf16/fp16 autocast crashes inside HGTConv. TF32 is enabled via `enable_perf_settings()` and is safe.
+- **Eval encode falls back to CPU** (`cfg.eval_encode_on_cpu=True`). The full-graph forward exceeds 6 GB GPU; encoding on CPU + scoring on GPU is the safe default. On a 16 GB+ GPU you can flip this off for faster eval.
+- **Per-epoch reset is mandatory on long runs.** Worker subprocesses + PyTorch's caching allocator leak (~3 GB RAM/epoch on Windows). `train.py` does `del loader; gc.collect(); empty_cache(); build_loader()` at the end of each epoch — costs ~30 s/epoch, prevents the ~40-min throughput collapse.
+- **Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** before launching on the A4000 to avoid VRAM-fragmentation spillover into shared system memory.
+- **`persistent_workers=False` on Windows** (default). Setting it True causes the working-set trimmer to SIGKILL idle workers silently, after which PyG falls back to main-thread sampling at ~7× slowdown.
+- `requirements.txt` is plain ASCII (pipreqs-generated, 10 lines). The conda env name for this project is `pfe`.
 
 ## graphify
 
