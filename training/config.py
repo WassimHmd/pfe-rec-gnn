@@ -40,6 +40,13 @@ class Config:
     user_use_id:        bool = True
     u_category_use_id:  bool = True   # Genre / Shelf / Language / Format / Publisher
 
+    # ── Relative Temporal Encoding (lightweight: absolute time as feature) ──────
+    # Appends sinusoidal encoding of each node's timestamp to its input features.
+    # Requires `data[nt].t` to exist in the HeteroData (set by preprocess.ipynb step 10).
+    # NOT the layer-level Hu et al. 2020 RTE — just a cheap "is temporal info useful?" ablation.
+    use_rte: bool = False
+    rte_dim: int  = 32     # sinusoidal encoding width (must be even)
+
     # ── Encoder ──────────────────────────────────────────────────────────────────
     encoder:    str   = "hgt"
     d_model:    int   = 256
@@ -63,6 +70,9 @@ class Config:
     amp_dtype:           str   = "none"      # "bfloat16" | "float16" | "none"
     epochs:              int   = 50
     neg_ratio:           int   = 5
+    loss:                str   = "bce"  # "bce" | "bpr" | "infonce"
+    infonce_tau:         float = 1.0    # softmax temperature for InfoNCE
+    neg_pop_alpha:       float = 0.75   # popularity exponent (word2vec convention); 0.0 = uniform
     early_stop_patience: int   = 5
     grad_clip:           float = 1.0
     num_workers:         int   = 4    # NeighborLoader workers; 0 = main process

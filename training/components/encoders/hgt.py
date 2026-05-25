@@ -34,6 +34,7 @@ class HGTEncoder(Encoder):
         self,
         x_dict: Dict[str, Tensor],
         edge_index_dict: Dict[tuple, Tensor],
+        t_dict: Dict[str, Tensor] | None = None,   # ignored — HGTEncoder is time-agnostic
     ) -> Dict[str, Tensor]:
         h_dict = {nt: self.input_proj[nt](x) for nt, x in x_dict.items()}
         for conv in self.convs:

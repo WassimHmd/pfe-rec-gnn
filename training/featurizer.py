@@ -13,6 +13,7 @@ Convention: text occupies the first 768 columns of any stored `x`; numeric the r
 
 from __future__ import annotations
 
+import math
 from typing import Dict
 
 import torch
@@ -21,6 +22,23 @@ from torch_geometric.data import HeteroData
 
 
 TEXT_DIM = 768
+
+
+def sinusoidal_time(t: Tensor, dim: int) -> Tensor:
+    """Standard transformer-style time encoding.
+
+    Args:
+        t:   (N,) float tensor of timestamps (any continuous units; we use years-since-1900)
+        dim: output dim (must be even)
+    Returns: (N, dim) tensor.
+    """
+    assert dim % 2 == 0, f"rte_dim must be even, got {dim}"
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
+    )
+    angles = t.float().unsqueeze(-1) * freqs.unsqueeze(0)   # (N, half)
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
 
 
 # (node_type → which config attribute controls each feature block; None means feature N/A)

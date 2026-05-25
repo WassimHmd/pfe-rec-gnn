@@ -1,6 +1,9 @@
 # .gitignore
 data/raw/
 data/processed/
+data/processed_multi/
+data/processed_multi_poetry/
+data_raw/
 *.h5
 *.npy
 *.parquet
@@ -11,6 +14,9 @@ data/processed/
 !data/processed/*_to_idx.json
 !data/processed/*_norm_stats.json
 !data/processed/*_columns.json
+!data/processed_multi/*_to_idx.json
+!data/processed_multi/*_norm_stats.json
+!data/processed_multi/*_columns.json
 
 *graphify-out
 

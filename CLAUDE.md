@@ -2,11 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠ Planning convention
+
+**Ignore the "Phase 1 / Phase 2 / Phase 3" framing** in `goodreads-hgt-project-spec-v2.md`. Work is prioritized ad hoc, not by phase. When the spec defers something "to Phase 2" or marks a shortcut "Phase 1 only," treat it as **a known follow-up with no scheduled time**, not a stage gate. Do not refuse, defer, or scope work based on which phase it's tagged in. The phases exist only as historical breadcrumbs in the spec doc — they are not a real planning structure.
+
 ## Project Overview
 
 **HGT4Rec** — a heterogeneous knowledge-graph recommender (Master's thesis / PFE) built on the UCSD Goodreads poetry slice. The model is a Heterogeneous Graph Transformer (HGT, Hu et al. WWW 2020) trained for user→book link prediction. Full spec: `goodreads-hgt-project-spec-v2.md` (authoritative — follow it when this file is silent).
 
-Pipeline stages (Phase 1 complete; training runs reproducible end-to-end):
+Pipeline stages (all built; training runs reproducible end-to-end):
 1. **Preprocessing** — `preprocessing/preprocess.ipynb`: one notebook, Mongo → `data/processed/`. Produces every `*_to_idx.json`, `*_bge_base_768.h5`, `*_numeric.npy`, `splits/{train,val,test}.npz`, and `hetero_data.pt`. Parameterize `SLICE_DB` / `META_DB` at the top to point at any Goodreads slice.
 2. **Training** — `training/train.py`: HGT4Rec link prediction with HeteroData input, checkpointing, resume, per-epoch memory-leak reset.
 3. **Neo4j** — optional visualization only (last cell of the preprocess notebook, off by default).
@@ -43,7 +47,9 @@ MongoDB layout: `goodreads.{books, authors, works}` and `poetry.{reviews, intera
 
 ## Node Featurization Categories
 
-Three patterns — **no per-type InputMLP**. Direct concatenation; dimension unification deferred to HGT layer 1.
+Three patterns. The **featurizer** (`training/featurizer.py`) just concatenates the enabled blocks per type — no nonlinearity, no per-type MLP. Dimension unification happens in the **encoder** (`training/components/encoders/hgt.py:25-30`) via one `Linear(in_dim_t, d_model)` per node type, applied right before `HGTConv`.
+
+This is a deliberate deviation from the original spec ("defer dimension unification to HGT layer 1"): pushing unification into HGTConv would have required `HGTConv(in_channels=dict, out_channels=d_model)`, where the 4 internal projections (K/Q/V/output) each scale with the per-type input dim — ~2-3M extra parameters with little quality gain. The current single Linear per type costs ~960K total and keeps HGTConv operating uniformly in `d_model` space.
 
 | Category | Formula | Node types |
 |---|---|---|
@@ -55,7 +61,7 @@ Book is TN (not MN) — edition metadata already defines it; an ID embedding ove
 
 Book feature matrix at training time: **(36514, 777)** = 768 (text) ∥ 9 (numeric).
 
-### Book numeric block (9 dims, frozen for Phase 1)
+### Book numeric block (9 dims, frozen)
 ```
 log1p(num_pages), year_normalized, average_rating, log1p(ratings_count),
 log1p(text_reviews_count), is_ebook, is_num_pages_missing, is_year_missing,
@@ -99,7 +105,11 @@ loss  = BCE(score, label)
 ```
 No elementwise product, no absolute difference.
 
-**Positive label**: `is_read=True` OR `rating ≥ 4`. **Negatives**: uniform random user–book pairs absent from all edge types, ratio 1:5.
+**Positive label**: `rating ≥ 4` (i.e. `RATED_HIGH`). **Explicit negative**: `rating ∈ [1, 3]` (i.e. `RATED_LOW`). **Sampled negatives**: uniform random user–book pairs absent from all edge types, ratio 1:5.
+
+**`READ_UNRATED` is NOT supervision** — read-but-unrated is graph-only (it stays as a `user → book` message-passing edge but never enters `train.npz` / `val.npz` / `test.npz`). Rationale: "engaged with" ≠ "preferred" — Goodreads users who read but didn't rate are a mix of "forgot," "didn't love it," and "DNF marked-read prematurely," contaminating ~10% of supervision if labeled positive. The graph still benefits from the "user read this book" signal.
+
+`READ_UNRATED` graph edges are filtered to `date_added < T_val` so val/test interactions don't leak into the message-passing graph.
 
 **Evaluation**: NDCG@10, MRR, AUC. Dedup at work-level (highest-scoring book per work).
 
@@ -117,7 +127,7 @@ data/processed/
 ├── books_bge_base_768.h5          # (36514, 768) float32, sorted by ascending book_id
 ├── book_numeric.npy               # (36514, 9) float32, same row order as h5
 ├── book_id_to_idx.json            # book_id → row index (canonical)
-├── book_norm_stats.json           # imputation/z-score stats (full-corpus, Phase 1 shortcut)
+├── book_norm_stats.json           # imputation/z-score stats (full-corpus; known shortcut, see notes)
 ├── book_numeric_columns.json      # column order documentation
 │
 ├── authors_bge_base_768.h5
@@ -156,7 +166,7 @@ Raw data (`data/raw/`) and large artifacts (`*.h5`, `*.npy`, `*.pt`) are gitigno
 
 ## Status
 
-**Phase 1 complete.** All preprocessing artifacts on disk; `HeteroData` + temporal splits built; modular HGT training pipeline runs end-to-end with checkpointing, resume, and per-epoch reset for memory-leak mitigation. Smoke + multi-epoch runs verified on laptop (6 GB GPU) and queued for full-spec runs on A4000 (16 GB).
+All preprocessing artifacts on disk; `HeteroData` + temporal splits built; modular HGT training pipeline runs end-to-end with checkpointing, resume, and per-epoch reset for memory-leak mitigation. Smoke + multi-epoch runs verified on laptop (6 GB GPU); full-spec runs in progress on A4000 (16 GB).
 
 **Training pipeline layout** (`training/`):
 - `train.py` — entry point, CLI, loop, checkpointing
@@ -176,12 +186,12 @@ Raw data (`data/raw/`) and large artifacts (`*.h5`, `*.npy`, `*.pt`) are gitigno
 ## Key Implementation Notes
 
 ### Data / featurization
-- Text and numeric are stored **separately on disk**, concatenated in CPU at `HeteroData` construction time. Rationale: enables independent updates and Phase 3 encoder fine-tuning.
+- Text and numeric are stored **separately on disk**, concatenated in CPU at `HeteroData` construction time. Rationale: enables independent updates and future encoder fine-tuning without re-embedding.
 - Review text is NOT stored on Neo4j `Review` nodes — metadata only in Neo4j, text in HDF5.
 - All embeddings are L2-normalized at generation time → cosine similarity = dot product downstream.
 - Neo4j bulk writes use 10K-row chunked `MERGE` batches.
 - Timestamps use Goodreads format `"%a %b %d %H:%M:%S %z %Y"` — parse with `utc=True` to normalize timezones.
-- `*_norm_stats.json` stats are computed over the full corpus (Phase 1 shortcut, documented in `_note` field) — tighten to training split in Phase 2.
+- `*_norm_stats.json` stats are computed over the full corpus (known shortcut, documented in `_note` field) — tighten to training split when this becomes load-bearing.
 - The five U-category categorical node types (Genre, Shelf, Language, Format, Publisher) are a deliberate design decision — do not drop them without new evidence (spec §13).
 
 ### Training operational gotchas
@@ -192,6 +202,7 @@ Raw data (`data/raw/`) and large artifacts (`*.h5`, `*.npy`, `*.pt`) are gitigno
 - **Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** before launching on the A4000 to avoid VRAM-fragmentation spillover into shared system memory.
 - **`persistent_workers=False` on Windows** (default). Setting it True causes the working-set trimmer to SIGKILL idle workers silently, after which PyG falls back to main-thread sampling at ~7× slowdown.
 - `requirements.txt` is plain ASCII (pipreqs-generated, 10 lines). The conda env name for this project is `pfe`.
+- **RTE ablation** (lightweight): `--use_rte` flag enables sinusoidal time encoding as an extra per-node feature block (years-since-1900). Per-node timestamps are computed in `preprocess.ipynb` step 10 and stored as `data[nt].t`. Books → `publication_year`; reviews → `date_added`; users → max interaction date; works/authors → mean of their books' pub years; U-category (Genre/Shelf/Lang/Format/Publisher) → slice median (constant). This is **NOT** the layer-level Hu et al. 2020 RTE that injects Δt into messages — it's a cheap "does temporal info help?" ablation. If `--use_rte` is on and `data[nt].t` is missing, the featurizer raises; re-run preprocessing step 10 in that case.
 
 ## graphify
 

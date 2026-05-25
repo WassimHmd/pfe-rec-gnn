@@ -77,6 +77,7 @@ def evaluate(
     split: str,
     cfg,
     device: torch.device,
+    return_per_user: bool = False,
 ) -> dict:
     splits_dir = Path(splits_dir)
     model.eval()
@@ -140,6 +141,7 @@ def evaluate(
         users = users[: cfg.eval_max_users]
 
     ndcgs, mrrs, aucs = [], [], []
+    per_user_records: list[dict] = []   # one row per eval'd user, only populated if return_per_user
     K = cfg.eval_k
 
     for u in tqdm(users, desc=f"eval/{split}"):
@@ -180,27 +182,41 @@ def evaluate(
         rank_of[sorted_idx] = torch.arange(scores_for_rank.shape[0], device=device)
         pos_ranks = rank_of[torch.tensor(list(positive_ids), device=device)]
 
-        # NDCG@K
-        ndcgs.append(_ndcg_at_k(pos_ranks.cpu(), K))
-        # MRR (over the first positive)
-        mrrs.append(float((1.0 / (pos_ranks.float() + 1.0)).max().item()))
+        # NDCG@K and MRR — always computable when positive_ids is non-empty
+        ndcg_u = _ndcg_at_k(pos_ranks.cpu(), K)
+        mrr_u  = float((1.0 / (pos_ranks.float() + 1.0)).max().item())
+        ndcgs.append(ndcg_u)
+        mrrs.append(mrr_u)
 
-        # AUC against all eligible negatives
+        # AUC against all eligible negatives — may skip if degenerate
+        auc_u: float | None = None
         y_score = scores_for_rank.cpu().numpy()
         finite_mask = np.isfinite(y_score)
-        if finite_mask.sum() < 2:
-            continue
-        y_true = np.zeros_like(y_score)
-        y_true[list(positive_ids)] = 1
-        y_true = y_true[finite_mask]
-        y_score = y_score[finite_mask]
-        if y_true.sum() == 0 or y_true.sum() == y_true.size:
-            continue
-        aucs.append(roc_auc_score(y_true, y_score))
+        if finite_mask.sum() >= 2:
+            y_true = np.zeros_like(y_score)
+            y_true[list(positive_ids)] = 1
+            y_true = y_true[finite_mask]
+            y_score = y_score[finite_mask]
+            if 0 < y_true.sum() < y_true.size:
+                auc_u = float(roc_auc_score(y_true, y_score))
+                aucs.append(auc_u)
 
-    return {
+        if return_per_user:
+            per_user_records.append({
+                "user_idx": int(u),
+                "n_pos":    int(len(positive_ids)),
+                "ndcg":     float(ndcg_u),
+                "mrr":      float(mrr_u),
+                "auc":      auc_u,
+                "best_rank": int(pos_ranks.min().item()),
+            })
+
+    result = {
         f"ndcg{K}": float(np.mean(ndcgs)) if ndcgs else 0.0,
         "mrr":      float(np.mean(mrrs)) if mrrs else 0.0,
         "auc":      float(np.mean(aucs)) if aucs else 0.0,
         "n_users":  len(ndcgs),
     }
+    if return_per_user:
+        result["per_user"] = per_user_records
+    return result

@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import BCEWithLogitsLoss
+from torch.nn import functional as F
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import LinkNeighborLoader
 from torch_geometric.sampler import NegativeSampling
@@ -56,6 +57,31 @@ def main():
     parser.add_argument("--id_dim",     type=int,   default=None)
     parser.add_argument("--no_shelved", action="store_true",
                         help="drop SHELVED edges (huge: 1.4M)")
+    parser.add_argument("--no_genre",   action="store_true",
+                        help="drop HAS_GENRE edges (10-genre Goodreads taxonomy; very coarse)")
+    parser.add_argument("--no_shelf",   action="store_true",
+                        help="drop HAS_SHELF edges (top-60 user-shelf folksonomy)")
+    parser.add_argument("--no_review",  action="store_true",
+                        help="drop WROTE + REVIEWS edges (review nodes become orphans)")
+    parser.add_argument("--no_authored",action="store_true",
+                        help="drop AUTHORED_BY edges")
+    parser.add_argument("--no_edition", action="store_true",
+                        help="drop EDITION_OF edges")
+    parser.add_argument("--no_lfp",     action="store_true",
+                        help="drop IN_LANGUAGE + IN_FORMAT + PUBLISHED_BY edges")
+    parser.add_argument("--loss",       type=str,   default=None, choices=["bce", "bpr", "infonce"],
+                        help="training loss: 'bce' (binary classification), 'bpr' (pairwise ranking), "
+                             "or 'infonce' (in-batch + popularity-weighted negatives)")
+    parser.add_argument("--infonce_tau",   type=float, default=None,
+                        help="InfoNCE softmax temperature (default 1.0); only used when --loss infonce")
+    parser.add_argument("--neg_pop_alpha", type=float, default=None,
+                        help="popularity exponent for negative sampling (0.75 = word2vec, 1.0 = pure pop, "
+                             "0.0 = uniform); only used when --loss infonce")
+    parser.add_argument("--use_rte", action="store_true",
+                        help="enable lightweight RTE: append sinusoidal time encoding to "
+                             "each node's input features (requires data[nt].t)")
+    parser.add_argument("--rte_dim", type=int, default=None,
+                        help="RTE sinusoidal width (default 32; must be even)")
     parser.add_argument("--max_train_edges", type=int, default=0,
                         help="cap supervision edges (0 = all). Useful for smoke tests.")
     parser.add_argument("--num_workers", type=int, default=None,
@@ -63,6 +89,10 @@ def main():
     parser.add_argument("--persistent_workers", action="store_true",
                         help="keep workers alive between epochs (default off; "
                              "Windows can SIGKILL idle workers' memory over long runs)")
+    parser.add_argument("--data_path",  type=str, default=None,
+                        help="override Config.data_path (e.g. data/processed_multi/hetero_data.pt)")
+    parser.add_argument("--splits_dir", type=str, default=None,
+                        help="override Config.splits_dir (e.g. data/processed_multi/splits)")
     parser.add_argument("--resume", type=str, default=None,
                         help="path to a best.pt to resume from (e.g. training/runs/<ts>/best.pt)")
     parser.add_argument("--note",       type=str,   default="")
@@ -80,6 +110,24 @@ def main():
     if args.num_workers  is not None: cfg.num_workers  = args.num_workers
     if args.persistent_workers:       cfg.persistent_workers = True
     if args.no_shelved:               cfg.use_shelved_edges = False
+    if args.no_genre:                 cfg.use_genre_edges = False
+    if args.no_shelf:                 cfg.use_shelf_edges = False
+    if args.no_review:                cfg.use_review_edges = False
+    if args.no_authored:              cfg.use_authored_by_edges = False
+    if args.no_edition:               cfg.use_edition_of_edges = False
+    if args.no_lfp:                   cfg.use_lang_format_publisher_edges = False
+    if args.use_rte:                  cfg.use_rte = True
+    if args.rte_dim     is not None:  cfg.rte_dim = args.rte_dim
+    if args.loss          is not None:  cfg.loss = args.loss
+    if args.infonce_tau   is not None:  cfg.infonce_tau = args.infonce_tau
+    if args.neg_pop_alpha is not None:  cfg.neg_pop_alpha = args.neg_pop_alpha
+    if args.data_path     is not None:  cfg.data_path  = args.data_path
+    if args.splits_dir    is not None:  cfg.splits_dir = args.splits_dir
+
+    if cfg.loss in {"bpr", "infonce"} and cfg.use_rated_low_as_neg:
+        print(f"{cfg.loss.upper()} mode: dropping RATED_LOW from supervision input "
+              "(ranking losses don't use them as explicit class labels).")
+        cfg.use_rated_low_as_neg = False
 
     device = device_auto()
     set_seed(cfg.seed)
@@ -95,6 +143,9 @@ def main():
     # ── Data ────────────────────────────────────────────────────────────────
     print(f"\nLoading {cfg.data_path}...")
     data: HeteroData = torch.load(cfg.data_path, weights_only=False)
+    # pyg_lib.index_sort requires contiguous edge_index; preprocessing may save sliced/permuted tensors.
+    for et in data.edge_types:
+        data[et].edge_index = data[et].edge_index.contiguous()
     data = filter_graph(data, cfg)
     print(f"  {len(data.node_types)} node types, {len(data.edge_types)} edge types")
 
@@ -120,6 +171,63 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn   = BCEWithLogitsLoss()
+
+    # Popularity-weighted dst sampling for InfoNCE (book popularity from train.npz positives).
+    if cfg.loss == "infonce":
+        train_z = np.load(Path(cfg.splits_dir) / "train.npz")
+        pop_counts = np.bincount(
+            train_z["book_idx"][train_z["label"] == 1],
+            minlength=data["book"].num_nodes,
+        ).astype(np.float32)
+        book_dst_weight = torch.from_numpy((pop_counts + 1.0) ** cfg.neg_pop_alpha)
+        print(f"InfoNCE: popularity-weighted dst sampling, alpha={cfg.neg_pop_alpha}, "
+              f"pop[min,p50,max]=({int(pop_counts.min())}, {int(np.median(pop_counts))}, "
+              f"{int(pop_counts.max())})")
+    else:
+        book_dst_weight = None
+
+    def compute_loss(logits, edge_label, h_dict=None, ei=None):
+        if cfg.loss == "bce":
+            target = (edge_label == 2).float()
+            return loss_fn(logits, target)
+
+        # PyG's NegativeSampling(mode="binary") repeat_interleaves the source — so for
+        # input positive i in [0, M), its K corresponding negatives sit at
+        # logits[M + i*K : M + (i+1)*K]. Same user, sampled (possibly popularity-weighted) books.
+        M = (edge_label > 0).sum().item()
+        K = cfg.neg_ratio
+        assert logits.numel() == M * (1 + K), \
+            f"shape mismatch: expected {M}*(1+{K})={M*(1+K)}, got {logits.numel()} " \
+            "(ranking losses require all input edges to be positives — set use_rated_low_as_neg=False)"
+
+        if cfg.loss == "bpr":
+            pos = logits[:M]                 # (M,)
+            neg = logits[M:].view(M, K)      # (M, K)
+            diff = pos.unsqueeze(1) - neg    # (M, K)
+            return -F.logsigmoid(diff).mean()
+
+        # InfoNCE: softmax cross-entropy over [in-batch other positives] ∪ [popularity-weighted negs].
+        # The popularity negs come from PyG's NegativeSampling(weight=...); in-batch negs come from
+        # cross-scoring the M positives against each other through the same MLP head.
+        assert h_dict is not None and ei is not None, "InfoNCE needs encoder outputs"
+        pos_users = ei[0, :M]                            # (M,) local subgraph user indices
+        pos_books = ei[1, :M]                            # (M,) local positive book indices
+        h_u = h_dict["user"][pos_users]                  # (M, d_model)
+        h_b = h_dict["book"][pos_books]                  # (M, d_model)
+        Md  = h_u.size(0)
+        d   = h_u.size(1)
+        # M×M cross-product through the MLP head (positives are the diagonal).
+        u_grid = h_u.unsqueeze(1).expand(Md, Md, d).reshape(Md * Md, d)
+        b_grid = h_b.unsqueeze(0).expand(Md, Md, d).reshape(Md * Md, d)
+        in_batch = model.head(u_grid, b_grid).view(Md, Md)
+        # Build [pos | in-batch others (-inf on diagonal) | popularity negs] for each anchor.
+        pos_scores = in_batch.diagonal().unsqueeze(1)                                # (M, 1)
+        eye_mask   = torch.eye(Md, device=in_batch.device, dtype=torch.bool)
+        in_others  = in_batch.masked_fill(eye_mask, float("-inf"))                   # (M, M)
+        pop_negs   = logits[M:].view(Md, K)                                          # (M, K)
+        all_s      = torch.cat([pos_scores, in_others, pop_negs], dim=1)             # (M, 1+M+K)
+        target     = torch.zeros(Md, dtype=torch.long, device=all_s.device)
+        return F.cross_entropy(all_s / cfg.infonce_tau, target)
 
     # ── Optional resume from checkpoint ─────────────────────────────────────
     start_epoch = 0
@@ -148,7 +256,9 @@ def main():
             num_neighbors=cfg.fanout,
             edge_label_index=(SUPERVISION_KEY, sup_ei),
             edge_label=sup_lab,
-            neg_sampling=NegativeSampling(mode="binary", amount=cfg.neg_ratio),
+            neg_sampling=NegativeSampling(
+                mode="binary", amount=cfg.neg_ratio, dst_weight=book_dst_weight,
+            ),
             batch_size=cfg.batch_size,
             shuffle=True,
             num_workers=cfg.num_workers,
@@ -179,14 +289,16 @@ def main():
             batch = batch.to(device)
             optimizer.zero_grad()
             with amp_ctx(cfg.amp_dtype, device):
-                logits = model(batch)
+                # InfoNCE needs h_dict for the M×M in-batch cross-product; other losses don't.
+                # Splitting encode/head is otherwise equivalent to model.forward().
+                h_dict = model.encode(batch)
+                ei     = batch[SUPERVISION_KEY].edge_label_index
+                logits = model.head(h_dict["user"][ei[0]], h_dict["book"][ei[1]])
                 # PyG's NegativeSampling(mode="binary") relabels:
                 #   0 = sampled random negative
                 #   1 = our explicit negative (input label 0, RATED_LOW)
                 #   2 = our positive       (input label 1, RATED_HIGH ∪ READ_UNRATED)
-                # BCE target = 1 iff the edge is a real positive.
-                labels = (batch[SUPERVISION_KEY].edge_label == 2).float()
-                loss   = loss_fn(logits, labels)
+                loss = compute_loss(logits, batch[SUPERVISION_KEY].edge_label, h_dict, ei)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()

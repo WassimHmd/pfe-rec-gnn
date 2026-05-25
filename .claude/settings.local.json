@@ -13,7 +13,13 @@
       "Bash(Select-Object Name, FullName)",
       "Bash(Format-Table -AutoSize)",
       "Bash(python3 *)",
-      "Bash(jupyter nbconvert *)"
+      "Bash(jupyter nbconvert *)",
+      "Bash(python *)",
+      "Bash(findstr /R \"data_path splits_dir loss\")",
+      "Bash(tasklist)",
+      "Bash(tasklist *)",
+      "Bash(nvidia-smi --query-gpu=memory.used,memory.free,memory.total --format=csv)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv)"
     ]
   }
 }

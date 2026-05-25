@@ -42,7 +42,9 @@ class HGT4Rec(nn.Module):
         x_dict = self.featurizer(batch)
         # Strip the synthetic supervision edge type before HGTConv.
         eidx = {k: v for k, v in batch.edge_index_dict.items() if k[1] != SUPERVISION_REL}
-        return self.encoder(x_dict, eidx)
+        # Collect per-node-type timestamps for RTE-aware encoders (None for the rest).
+        t_dict = {nt: batch[nt].t for nt in batch.node_types if "t" in batch[nt]}
+        return self.encoder(x_dict, eidx, t_dict=t_dict if t_dict else None)
 
     def forward(self, batch: HeteroData) -> Tensor:
         h_dict = self.encode(batch)

@@ -11,7 +11,7 @@ This is v2 of the project spec. It supersedes the original `goodreads-hgt-projec
 Material changes since the original spec, with brief rationale:
 
 - **Text embeddings: BGE-base at 768 dim**, not BGE-small at 384. File convention: `books_bge_base_768.h5` (parallel files for other node types).
-- **No per-type InputMLP** at the featurization layer. Initial features are direct concatenation (`||`) of components; per-type dimension unification is handled by HGT layer 1's K/Q/M-Linear projections.
+- **Featurizer is concat-only (no MLP, no nonlinearity).** Per-type dimension unification happens via a single `Linear(in_dim_t, d_model)` per node type at the encoder boundary (one matrix per type, applied right before HGTConv). Original spec direction was to push unification into HGTConv layer 1's K/Q/V projections themselves, which costs ~2-3M extra params (4 matrices × per-type in_dim × d_model) vs ~960K for the current Linear input_proj. Kept as a deliberate parameter optimization. See `training/components/encoders/hgt.py:25-30`.
 - **Three node featurization categories formalized**: U (ID-only), MN (ID + text + numeric), TN (text + numeric, no ID embedding).
 - **Book moved from MN to TN** — gets text + numeric but no ID embedding. Rationale: editions are essentially defined by their metadata; an ID embedding over editions adds parameters without obvious signal.
 - **Link prediction head simplified to pure concat-MLP** on `[h_u || h_v]`. No elementwise product, no absolute difference. Placeholder — revise after experiments.
@@ -128,7 +128,7 @@ data/processed/
 
 ### 3.2 Node featurization categories
 
-Three patterns, no per-type InputMLP. Initial features are direct concatenation; dimension unification deferred to HGT layer 1.
+Three patterns. The featurizer concatenates the enabled blocks per type — no MLP, no nonlinearity. Dimension unification is handled at the encoder boundary by one `Linear(in_dim_t, d_model)` per node type, placed before HGTConv. See §0 ("Material changes since v1") and `training/components/encoders/hgt.py:25-30`.
 
 **U (ID-only):**
 ```
